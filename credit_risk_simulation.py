@@ -1,0 +1,326 @@
+# -*- coding: utf-8 -*-
+"""
+Credit Portfolio Risk Simulation & Stress Testing
+==================================================
+End-to-end pipeline: PD estimation (grade-based + logistic regression),
+Vasicek single-factor correlated default simulation, portfolio risk
+metrics (VaR / Expected Shortfall / Economic Capital), and a recession
+stress test.
+
+Dataset: Lending Club loan-level data.
+"""
+
+# ---------------------------------------------------------------------
+# 1. Download & load data
+# ---------------------------------------------------------------------
+
+!gdown 14fat1rsKvEEev3uCXR1tkYCgEzQlIWEd
+!unzip loan.zip -d dataset
+
+import pandas as pd
+
+file_path = "/content/dataset/loan.csv"
+
+# Quick peek before loading the full file
+df_sample = pd.read_csv(file_path, nrows=10000)
+df_sample.info()
+
+# Load only the columns needed for this analysis
+cols_needed = [
+    'loan_amnt', 'funded_amnt', 'term', 'int_rate', 'installment',
+    'grade', 'sub_grade', 'annual_inc', 'loan_status', 'purpose',
+    'dti', 'addr_state', 'emp_length', 'home_ownership', 'issue_d'
+]
+
+df = pd.read_csv(file_path, usecols=cols_needed, low_memory=False)
+print(df.shape)
+df.head()
+
+df['loan_status'].value_counts()
+
+# ---------------------------------------------------------------------
+# 2. Define target variable (default = 1, fully paid = 0)
+# ---------------------------------------------------------------------
+
+# Keep only loans with a clear, final outcome
+final_statuses = ['Fully Paid', 'Charged Off']
+df_model = df[df['loan_status'].isin(final_statuses)].copy()
+
+df_model['default'] = (df_model['loan_status'] == 'Charged Off').astype(int)
+
+print(df_model.shape)
+df_model['default'].value_counts(normalize=True)
+
+# ---------------------------------------------------------------------
+# 3. Baseline PD estimate: empirical default rate by grade
+# ---------------------------------------------------------------------
+
+pd_by_grade = df_model.groupby('grade')['default'].mean().sort_index()
+print(pd_by_grade)
+
+df_model['PD'] = df_model['grade'].map(pd_by_grade)
+df_model[['grade', 'PD', 'loan_amnt']].head(10)
+
+# ---------------------------------------------------------------------
+# 4. Vasicek single-factor model
+# ---------------------------------------------------------------------
+# Adjusts each loan's PD based on a shared systematic economic factor Z,
+# so defaults move together rather than independently.
+
+import numpy as np
+from scipy.stats import norm
+
+rho = 0.15  # asset correlation - how strongly loans move together
+
+
+def conditional_pd(default_pd, z, rho):
+    """Vasicek formula: adjusts a baseline PD based on shared economic factor Z."""
+    numerator = norm.ppf(default_pd) - np.sqrt(rho) * z
+    denominator = np.sqrt(1 - rho)
+    return norm.cdf(numerator / denominator)
+
+
+# Sanity check: grade C loan (PD=0.225) in a normal vs. bad economy
+print("Normal economy (Z=0):", conditional_pd(0.225076, z=0, rho=rho))
+print("Bad economy (Z=-2):", conditional_pd(0.225076, z=-2, rho=rho))
+
+# ---------------------------------------------------------------------
+# 5. Monte Carlo simulation: baseline scenario
+# ---------------------------------------------------------------------
+
+np.random.seed(42)
+
+n_sims = 10000
+rho = 0.15
+
+pd_array = df_model['PD'].values
+exposure_array = df_model['loan_amnt'].values
+
+portfolio_losses = np.zeros(n_sims)
+
+for i in range(n_sims):
+    z = np.random.normal(0, 1)  # draw the shared economic factor
+
+    numerator = norm.ppf(pd_array) - np.sqrt(rho) * z
+    cond_pd = norm.cdf(numerator / np.sqrt(1 - rho))
+
+    defaults = np.random.binomial(1, cond_pd)
+    portfolio_losses[i] = np.sum(defaults * exposure_array)
+
+print("Simulation done!")
+print("Mean loss:", portfolio_losses.mean())
+print("Min loss:", portfolio_losses.min())
+print("Max loss:", portfolio_losses.max())
+
+# ---------------------------------------------------------------------
+# 6. Portfolio risk metrics
+# ---------------------------------------------------------------------
+
+expected_loss = portfolio_losses.mean()
+var_99 = np.percentile(portfolio_losses, 99)
+var_999 = np.percentile(portfolio_losses, 99.9)
+es_99 = portfolio_losses[portfolio_losses >= var_99].mean()
+economic_capital = var_99 - expected_loss
+
+print(f"Expected Loss:      ${expected_loss:,.0f}")
+print(f"VaR (99%):           ${var_99:,.0f}")
+print(f"VaR (99.9%):         ${var_999:,.0f}")
+print(f"Expected Shortfall:  ${es_99:,.0f}")
+print(f"Economic Capital:    ${economic_capital:,.0f}")
+
+# ---------------------------------------------------------------------
+# 7. Chart: baseline loss distribution
+# ---------------------------------------------------------------------
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(12, 6))
+plt.hist(portfolio_losses, bins=80, color='indianred', alpha=0.7, edgecolor='white')
+
+plt.axvline(expected_loss, color='green', linestyle='--', linewidth=2,
+            label=f'Expected Loss: ${expected_loss/1e9:.2f}B')
+plt.axvline(var_99, color='blue', linestyle='--', linewidth=2,
+            label=f'VaR 99%: ${var_99/1e9:.2f}B')
+plt.axvline(es_99, color='red', linestyle='--', linewidth=2,
+            label=f'Expected Shortfall: ${es_99/1e9:.2f}B')
+
+plt.title('Portfolio Loss Distribution (Baseline Scenario)', fontsize=14, fontweight='bold')
+plt.xlabel('Portfolio Loss ($)')
+plt.ylabel('Frequency (out of 10,000 simulations)')
+plt.legend(fontsize=10)
+plt.tight_layout()
+plt.savefig('loss_distribution_baseline.png', dpi=150)
+plt.show()
+
+# ---------------------------------------------------------------------
+# 8. Stress test: recession scenario
+# ---------------------------------------------------------------------
+# Shifts the mean of the systematic factor Z to simulate a sustained
+# economic downturn (roughly consistent with a severe recession shock,
+# in the spirit of CCAR-style scenario stress testing).
+
+np.random.seed(42)
+
+n_sims = 10000
+rho = 0.15
+stress_shift = -1.5
+
+portfolio_losses_stressed = np.zeros(n_sims)
+
+for i in range(n_sims):
+    z = np.random.normal(stress_shift, 1)
+
+    numerator = norm.ppf(pd_array) - np.sqrt(rho) * z
+    cond_pd = norm.cdf(numerator / np.sqrt(1 - rho))
+
+    defaults = np.random.binomial(1, cond_pd)
+    portfolio_losses_stressed[i] = np.sum(defaults * exposure_array)
+
+expected_loss_stressed = portfolio_losses_stressed.mean()
+var_99_stressed = np.percentile(portfolio_losses_stressed, 99)
+es_99_stressed = portfolio_losses_stressed[portfolio_losses_stressed >= var_99_stressed].mean()
+
+print("--- STRESSED SCENARIO (Recession) ---")
+print(f"Expected Loss:      ${expected_loss_stressed:,.0f}")
+print(f"VaR (99%):           ${var_99_stressed:,.0f}")
+print(f"Expected Shortfall:  ${es_99_stressed:,.0f}")
+print()
+print("--- INCREASE VS BASELINE ---")
+print(f"Expected Loss increase: {(expected_loss_stressed / expected_loss - 1) * 100:.1f}%")
+print(f"VaR 99% increase:       {(var_99_stressed / var_99 - 1) * 100:.1f}%")
+
+# ---------------------------------------------------------------------
+# 9. Chart: baseline vs. stressed comparison
+# ---------------------------------------------------------------------
+
+plt.figure(figsize=(12, 6))
+
+plt.hist(portfolio_losses, bins=80, color='steelblue', alpha=0.5,
+         label='Baseline', edgecolor='white')
+plt.hist(portfolio_losses_stressed, bins=80, color='crimson', alpha=0.5,
+         label='Stressed (Recession)', edgecolor='white')
+
+plt.axvline(expected_loss, color='steelblue', linestyle='--', linewidth=2)
+plt.axvline(expected_loss_stressed, color='crimson', linestyle='--', linewidth=2)
+
+plt.title('Portfolio Loss Distribution: Baseline vs. Stressed Scenario',
+          fontsize=14, fontweight='bold')
+plt.xlabel('Portfolio Loss ($)')
+plt.ylabel('Frequency (out of 10,000 simulations)')
+plt.legend(fontsize=11)
+plt.tight_layout()
+plt.savefig('loss_distribution_comparison.png', dpi=150)
+plt.show()
+
+# ---------------------------------------------------------------------
+# 10. Upgraded PD model: logistic regression
+# ---------------------------------------------------------------------
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+features = ['loan_amnt', 'int_rate', 'annual_inc', 'dti',
+            'term', 'grade', 'home_ownership', 'purpose', 'emp_length']
+
+df_lr = df_model[features + ['default']].copy()
+print(df_lr.isnull().sum())
+
+# NOTE: dropping 312 rows (~0.02% of the portfolio) with missing DTI.
+# The logistic-regression-based simulation below therefore runs on a
+# very slightly smaller loan population than the grade-based baseline.
+df_lr = df_lr.dropna(subset=['dti'])
+df_lr['emp_length'] = df_lr['emp_length'].fillna('Unknown')
+
+# term comes in as a string like " 36 months" - extract just the number
+df_lr['term'] = df_lr['term'].str.extract(r'(\d+)').astype(int)
+
+df_lr_encoded = pd.get_dummies(
+    df_lr, columns=['grade', 'home_ownership', 'purpose', 'emp_length'],
+    drop_first=True
+)
+
+print(df_lr_encoded.shape)
+df_lr_encoded.head()
+
+X = df_lr_encoded.drop(columns=['default'])
+y = df_lr_encoded['default']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+scaler = StandardScaler()
+numeric_cols = ['loan_amnt', 'int_rate', 'annual_inc', 'dti', 'term']
+
+X_train_scaled = X_train.copy()
+X_test_scaled = X_test.copy()
+X_train_scaled[numeric_cols] = scaler.fit_transform(X_train[numeric_cols])
+X_test_scaled[numeric_cols] = scaler.transform(X_test[numeric_cols])
+
+model = LogisticRegression(max_iter=1000)
+model.fit(X_train_scaled, y_train)
+print("Model trained!")
+
+# ---------------------------------------------------------------------
+# 11. Model evaluation: AUC / Gini, vs. grade-based baseline
+# ---------------------------------------------------------------------
+
+from sklearn.metrics import roc_auc_score
+
+y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+auc = roc_auc_score(y_test, y_pred_proba)
+gini = 2 * auc - 1
+
+print(f"AUC:  {auc:.4f}")
+print(f"Gini: {gini:.4f}")
+
+grade_pd_test = df_model.loc[X_test.index, 'PD']
+auc_grade = roc_auc_score(y_test, grade_pd_test)
+gini_grade = 2 * auc_grade - 1
+
+print("--- Grade-based PD (original approach) ---")
+print(f"AUC:  {auc_grade:.4f}")
+print(f"Gini: {gini_grade:.4f}")
+print()
+print("--- Logistic Regression (upgraded approach) ---")
+print(f"AUC:  {auc:.4f}")
+print(f"Gini: {gini:.4f}")
+print()
+print(f"Improvement in AUC: {(auc - auc_grade):.4f}")
+print(f"Improvement in Gini: {(gini - gini_grade):.4f}")
+
+# ---------------------------------------------------------------------
+# 12. Re-run portfolio simulation with the upgraded PD
+# ---------------------------------------------------------------------
+
+X_full_scaled = X.copy()
+X_full_scaled[numeric_cols] = scaler.transform(X[numeric_cols])
+df_lr_encoded['PD_model'] = model.predict_proba(X_full_scaled)[:, 1]
+
+pd_array_upgraded = df_lr_encoded['PD_model'].values
+exposure_array_upgraded = df_lr_encoded['loan_amnt'].values
+
+np.random.seed(42)
+n_sims = 10000
+rho = 0.15
+
+portfolio_losses_upgraded = np.zeros(n_sims)
+
+for i in range(n_sims):
+    z = np.random.normal(0, 1)
+    numerator = norm.ppf(pd_array_upgraded) - np.sqrt(rho) * z
+    cond_pd = norm.cdf(numerator / np.sqrt(1 - rho))
+    defaults = np.random.binomial(1, cond_pd)
+    portfolio_losses_upgraded[i] = np.sum(defaults * exposure_array_upgraded)
+
+expected_loss_upgraded = portfolio_losses_upgraded.mean()
+var_99_upgraded = np.percentile(portfolio_losses_upgraded, 99)
+
+print("--- UPGRADED MODEL (Logistic Regression PD) ---")
+print(f"Expected Loss: ${expected_loss_upgraded:,.0f}")
+print(f"VaR (99%):     ${var_99_upgraded:,.0f}")
+print()
+print("--- ORIGINAL (Grade-based PD) ---")
+print(f"Expected Loss: ${expected_loss:,.0f}")
+print(f"VaR (99%):     ${var_99:,.0f}")
