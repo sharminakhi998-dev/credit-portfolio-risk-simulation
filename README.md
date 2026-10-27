@@ -41,14 +41,7 @@ Most public credit risk projects stop at predicting whether a single loan will d
 - The economic factor's distribution was shifted to represent a severe recession (mean shifted to −1.5 standard deviations), consistent with the scenario-shock approach used in regulatory stress tests (e.g. CCAR).
 - Result: Expected Loss nearly doubled (+87%) while VaR rose more moderately (+41%) — because a shared downturn compresses previously "tail" outcomes into the "typical" range, rather than uniformly scaling all losses.
 
-## Repository Structure
 
-```
-├── credit_risk_simulation.ipynb   # Full analysis notebook
-├── loss_distribution_baseline.png # Baseline loss distribution chart
-├── loss_distribution_comparison.png # Baseline vs. stressed comparison
-└── README.md
-```
 
 ## Key Assumptions & Limitations
 
